@@ -8,7 +8,7 @@ import os
 # ===============================
 #  Load Model
 # ===============================
-MODEL_PATH = "C:\Users\Sneha.G\Documents\myopia_detector_app\myopia_detection_model.h5"
+MODEL_PATH = r"C:\Users\Sneha.G\Documents\myopia_detector_app\myopia_detection_model.h5"
 model = tf.keras.models.load_model(MODEL_PATH)
 
 # ===============================
