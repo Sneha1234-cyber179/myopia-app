@@ -1,0 +1,4 @@
+tensorflow
+opencv-python
+pyqt5
+numpy
