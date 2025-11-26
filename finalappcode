@@ -1,0 +1,370 @@
+import os
+import time
+import cv2
+import numpy as np
+from tkinter import *
+from tkinter import messagebox, filedialog
+from PIL import Image, ImageTk
+
+# ---------------------------
+# MODEL PATH (user provided)
+# ---------------------------
+MODEL_PATH = r"C:\Users\Sneha.G\Documents\myopia_detector_app\myopia_detection_model.h5"   # <- your filename
+
+# ---------------------------
+# Load TensorFlow model
+# ---------------------------
+try:
+    import tensorflow as tf
+except Exception as e:
+    messagebox.showerror("Import Error", f"Cannot import TensorFlow: {e}")
+    raise
+
+if not os.path.exists(MODEL_PATH):
+    messagebox.showerror("Model Error", f"Model file not found at: {MODEL_PATH}\nPlace the .h5 file in the script folder or update MODEL_PATH.")
+    raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+
+try:
+    model = tf.keras.models.load_model(MODEL_PATH)
+except Exception as e:
+    messagebox.showerror("Model Load Error", f"Failed to load model: {e}")
+    raise
+
+# ---------------------------
+# App configuration
+# ---------------------------
+EYE_CASCADE_FILENAME = "haarcascade_eye.xml"
+BOX_W, BOX_H = 240, 200
+MIN_EYE_SIZE = 60   # minimum width/height accepted for an eye inside the box
+
+# ---------------------------
+# Globals
+# ---------------------------
+cap = None
+eye_cascade = None
+
+scanning_left = True
+left_conf = None
+right_conf = None
+final_data = {}
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def preprocess_eye_roi_color(roi_bgr):
+    try:
+        img = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (128, 128))
+        img = img.astype("float32") / 255.0
+        img = np.expand_dims(img, axis=0)
+        return img
+    except Exception:
+        return None
+
+def classify_from_conf(conf):
+    if conf is None:
+        return "N/A"
+    if conf <= 0.3:
+        return "NORMAL"
+    elif conf >= 0.7:
+        return "MYOPIA"
+    else:
+        return "OTHER / INCONCLUSIVE"
+
+def map_confidence_to_diopter(conf):
+    # Example mapping — tune based on your dataset/labels
+    if conf is None:
+        return None
+    diopter = -1.0 - (conf * 5.0)  # approx -1.0 to -6.0 for conf 0->1
+    diopter = max(diopter, -12.0)
+    return round(diopter, 2)
+
+# ---------------------------
+# Scan button logic
+# ---------------------------
+def scan_eye_button():
+    global scanning_left, left_conf, right_conf
+
+    if cap is None or not cap.isOpened():
+        messagebox.showerror("Camera Error", "Webcam not available.")
+        return
+
+    ret, frame = cap.read()
+    if not ret:
+        messagebox.showerror("Camera Error", "Failed to read from webcam.")
+        return
+
+    h, w = frame.shape[:2]
+    bx1 = w // 2 - BOX_W // 2
+    by1 = h // 2 - BOX_H // 2
+    bx2 = bx1 + BOX_W
+    by2 = by1 + BOX_H
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
+
+    # Strict: accept only eyes whose centroid lies inside box and size >= MIN_EYE_SIZE
+    eyes_in_box = []
+    for (ex, ey, ew, eh) in eyes:
+        cx = ex + ew // 2
+        cy = ey + eh // 2
+        if bx1 <= cx <= bx2 and by1 <= cy <= by2 and ew >= MIN_EYE_SIZE and eh >= MIN_EYE_SIZE:
+            eyes_in_box.append((ex, ey, ew, eh))
+
+    if len(eyes_in_box) == 0:
+        messagebox.showwarning("Alignment", "No suitable eye detected inside the box. Place one eye centered in the box and try again.")
+        return
+    if len(eyes_in_box) > 1:
+        messagebox.showwarning("Alignment", "Multiple eye regions detected inside the box. Make sure only one eye is inside the box.")
+        return
+
+    ex, ey, ew, eh = eyes_in_box[0]
+    roi_color = frame[ey:ey+eh, ex:ex+ew]
+    input_img = preprocess_eye_roi_color(roi_color)
+    if input_img is None:
+        messagebox.showerror("Processing Error", "Failed to preprocess eye image.")
+        return
+
+    try:
+        pred = model.predict(input_img)[0][0]
+        pred = float(pred)
+    except Exception as e:
+        messagebox.showerror("Model Error", f"Prediction failed: {e}")
+        return
+
+    if scanning_left:
+        left_conf = pred
+        status_label.config(text=f"LEFT scanned — conf {left_conf*100:.1f}%")
+        scan_btn.config(text="Scan RIGHT Eye")
+        scanning_left = False
+    else:
+        right_conf = pred
+        status_label.config(text=f"RIGHT scanned — conf {right_conf*100:.1f}%")
+        scan_btn.config(state=DISABLED)
+        final_btn.config(state=NORMAL)
+        scanning_left = True
+
+    left_status_label.config(text=f"Left: {left_conf*100:.1f}%" if left_conf is not None else "Left: --")
+    right_status_label.config(text=f"Right: {right_conf*100:.1f}%" if right_conf is not None else "Right: --")
+
+# ---------------------------
+# Final analysis
+# ---------------------------
+def show_final_result():
+    global final_data
+    if left_conf is None or right_conf is None:
+        messagebox.showwarning("Incomplete", "Please complete both LEFT and RIGHT scans before showing final result.")
+        return
+
+    max_conf = max(left_conf, right_conf)
+    classification = classify_from_conf(max_conf)
+
+    if classification == "NORMAL":
+        diopter_text = "0.0 D"
+        color = "green"
+    elif classification == "MYOPIA":
+        diopter_val = map_confidence_to_diopter(max_conf)
+        diopter_text = f"{diopter_val} D" if diopter_val is not None else "--"
+        color = "red"
+    else:
+        diopter_text = "-- Consult Specialist --"
+        color = "orange"
+
+    final_result_label.config(text=classification, fg=color)
+    diopter_label.config(text=diopter_text, fg=color)
+    save_btn.config(state=NORMAL)
+
+    final_data = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "left_confidence": f"{left_conf*100:.1f}%",
+        "right_confidence": f"{right_conf*100:.1f}%",
+        "classification": classification,
+        "diopter": diopter_text
+    }
+    status_label.config(text="Analysis complete.")
+
+# ---------------------------
+# Save report
+# ---------------------------
+def save_report():
+    if not final_data:
+        messagebox.showwarning("No Data", "There's no final result to save.")
+        return
+    file_path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                             filetypes=[("Text files","*.txt")],
+                                             initialfile=f"Myopia_Report_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    if not file_path:
+        return
+    try:
+        with open(file_path, "w") as f:
+            f.write("--- Eye Diopter Scanner Report ---\n")
+            f.write(f"Scan Date: {final_data['timestamp']}\n")
+            f.write("----------------------------------\n")
+            f.write(f"FINAL DIAGNOSIS: {final_data['classification']}\n")
+            f.write(f"DIOPTER ESTIMATE: {final_data['diopter']}\n")
+            f.write("----------------------------------\n")
+            f.write(f"Left Eye Confidence: {final_data['left_confidence']}\n")
+            f.write(f"Right Eye Confidence: {final_data['right_confidence']}\n")
+            f.write("----------------------------------\n")
+            f.write("Disclaimer: This is a preliminary computer-generated prediction and does not replace a professional eye examination.\n")
+        messagebox.showinfo("Saved", f"Report saved to:\n{file_path}")
+    except Exception as e:
+        messagebox.showerror("Save Error", f"Unable to save report: {e}")
+
+# ---------------------------
+# Reset session
+# ---------------------------
+def reset_session():
+    global left_conf, right_conf, scanning_left, final_data
+    left_conf = None
+    right_conf = None
+    final_data = {}
+    scanning_left = True
+    scan_btn.config(text="Scan LEFT Eye", state=NORMAL)
+    final_btn.config(state=DISABLED)
+    save_btn.config(state=DISABLED)
+    left_status_label.config(text="Left: --")
+    right_status_label.config(text="Right: --")
+    final_result_label.config(text="--")
+    diopter_label.config(text="--")
+    status_label.config(text="Ready. Place LEFT eye in the box and press Scan.")
+
+# ---------------------------
+# Video & guidance overlay
+# ---------------------------
+def update_video():
+    if cap is None:
+        root.after(50, update_video)
+        return
+
+    ret, frame = cap.read()
+    if not ret:
+        root.after(50, update_video)
+        return
+
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+    bx1 = w // 2 - BOX_W // 2
+    by1 = h // 2 - BOX_H // 2
+    bx2 = bx1 + BOX_W
+    by2 = by1 + BOX_H
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
+
+    eyes_in_box = []
+    for (ex, ey, ew, eh) in eyes:
+        cx = ex + ew//2
+        cy = ey + eh//2
+        if bx1 <= cx <= bx2 and by1 <= cy <= by2 and ew >= MIN_EYE_SIZE and eh >= MIN_EYE_SIZE:
+            eyes_in_box.append((ex, ey, ew, eh))
+
+    aligned = (len(eyes_in_box) == 1)
+    box_color = (0,255,0) if aligned else (0,0,255)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (bx1, by1), (bx2, by2), box_color, 3)
+    alpha = 0.12
+    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+    cv2.rectangle(frame, (bx1, by1), (bx2, by2), box_color, 3)
+
+    for (ex, ey, ew, eh) in eyes:
+        cv2.rectangle(frame, (ex, ey), (ex+ew, ey+eh), (180,180,180), 1)
+
+    target_eye_text = "LEFT" if scanning_left else "RIGHT"
+    cv2.putText(frame, f"Target: {target_eye_text} eye - place inside box", (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240,240,240), 2)
+
+    if not aligned:
+        cv2.putText(frame, "Align one eye inside the box (green) for scanning", (10,60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+    else:
+        cv2.putText(frame, "Good alignment — press Scan", (10,60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
+    imgtk = ImageTk.PhotoImage(image=img_pil)
+    video_label.imgtk = imgtk
+    video_label.configure(image=imgtk)
+
+    video_label.after(20, update_video)
+
+# ---------------------------
+# Build UI
+# ---------------------------
+root = Tk()
+root.title("Guided Eye Diopter Scanner (Two-Eye Scan)")
+root.geometry("1000x720")
+root.configure(bg="#16324f")
+
+title = Label(root, text="👁️ Guided Eye Diopter Scanner", font=("Helvetica", 20, "bold"), bg="#16324f", fg="#dfeffc")
+title.pack(pady=8)
+
+video_frame = Frame(root, bg="black", bd=2, relief=SOLID)
+video_frame.pack(padx=12, pady=6)
+video_label = Label(video_frame)
+video_label.pack()
+
+info_frame = Frame(root, bg="#16324f")
+info_frame.pack(fill="x", padx=12, pady=6)
+
+status_label = Label(info_frame, text="Ready. Place LEFT eye in the box and press Scan.", font=("Arial", 12), bg="#16324f", fg="#f0f8ff")
+status_label.grid(row=0, column=0, sticky=W, padx=6)
+
+left_status_label = Label(info_frame, text="Left: --", font=("Arial", 12, "bold"), bg="#16324f", fg="#f0f8ff")
+left_status_label.grid(row=1, column=0, sticky=W, padx=6, pady=2)
+
+right_status_label = Label(info_frame, text="Right: --", font=("Arial", 12, "bold"), bg="#16324f", fg="#f0f8ff")
+right_status_label.grid(row=1, column=1, sticky=W, padx=6, pady=2)
+
+result_frame = Frame(root, bg="#1f3b55", bd=1, relief=RIDGE)
+result_frame.pack(fill="x", padx=12, pady=10)
+
+Label(result_frame, text="Final Result:", font=("Arial", 14, "bold"), bg="#1f3b55", fg="#eef6ff").grid(row=0, column=0, padx=8, pady=8, sticky=W)
+final_result_label = Label(result_frame, text="--", font=("Arial", 14, "bold"), bg="#1f3b55", fg="yellow")
+final_result_label.grid(row=0, column=1, padx=8, pady=8, sticky=W)
+
+Label(result_frame, text="Diopter Estimate:", font=("Arial", 14, "bold"), bg="#1f3b55", fg="#eef6ff").grid(row=1, column=0, padx=8, pady=8, sticky=W)
+diopter_label = Label(result_frame, text="--", font=("Arial", 14, "bold"), bg="#1f3b55", fg="yellow")
+diopter_label.grid(row=1, column=1, padx=8, pady=8, sticky=W)
+
+btn_frame = Frame(root, bg="#16324f")
+btn_frame.pack(padx=12, pady=10)
+
+scan_btn = Button(btn_frame, text="Scan LEFT Eye", font=("Arial", 14, "bold"), bg="#1abc9c", fg="#0b2b2b", padx=18, pady=10, command=scan_eye_button)
+scan_btn.grid(row=0, column=0, padx=8)
+
+final_btn = Button(btn_frame, text="Show Final Result", font=("Arial", 14, "bold"), bg="#3498db", fg="white", padx=18, pady=10, state=DISABLED, command=show_final_result)
+final_btn.grid(row=0, column=1, padx=8)
+
+save_btn = Button(btn_frame, text="Save Report", font=("Arial", 14, "bold"), bg="#f39c12", fg="white", padx=18, pady=10, state=DISABLED, command=save_report)
+save_btn.grid(row=0, column=2, padx=8)
+
+reset_btn = Button(btn_frame, text="Reset", font=("Arial", 14, "bold"), bg="#e74c3c", fg="white", padx=18, pady=10, command=reset_session)
+reset_btn.grid(row=0, column=3, padx=8)
+
+# ---------------------------
+# Start camera
+# ---------------------------
+cascade_path = cv2.data.haarcascades + EYE_CASCADE_FILENAME
+if not os.path.exists(cascade_path):
+    cascade_path = cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+eye_cascade = cv2.CascadeClassifier(cascade_path)
+
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    messagebox.showerror("Camera", "Unable to open webcam. Check camera and permissions.")
+else:
+    update_video()
+
+def on_close():
+    try:
+        if cap is not None:
+            cap.release()
+    except:
+        pass
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
